@@ -7,7 +7,15 @@ const Payment = require("../models/Payment");
 const Member = require("../models/Member");
 const Membership = require("../models/Membership");
 const MembershipPlan = require("../models/MembershipPlan");
-const Notification = require("../models/Notification");
+const {
+  recordAuditEvent,
+  withAuditTransaction,
+} = require("../services/auditLogService");
+const { enqueueMemberNotification } = require("../services/notificationOutboxService");
+const {
+  getMembershipExtensionDates,
+  isMembershipCurrent,
+} = require("../utils/membershipRules");
 
 // Payment methods that members pay manually outside the platform.
 // Members must attach a transfer screenshot for these; staff then
@@ -109,84 +117,132 @@ const planLabel = (payment) =>
 |--------------------------------------------------------------------------
 */
 
-const activateMembershipForPayment = async (payment) => {
-  // plan/member may be raw ObjectIds or populated documents.
-  const planId = payment.plan?._id || payment.plan;
-  const memberId = payment.member?._id || payment.member;
+const activateMembershipForPayment = async (payment, auditEvent) => {
+  const session = await mongoose.startSession();
+  let activated = false;
 
-  if (!planId) return null;
-
-  const plan = await MembershipPlan.findById(planId);
-
-  if (!plan) return null;
-
-  // Find the member's currently active membership, if any.
-  const activeMembership = await Membership.findOne({
-    member: memberId,
-    status: "active",
-    endDate: { $gte: new Date() },
-  }).sort({ endDate: -1 });
-
-  // New membership starts after the active one ends, or today.
-  const startDate = activeMembership
-    ? new Date(activeMembership.endDate)
-    : new Date();
-
-  const endDate = new Date(startDate);
-
-  endDate.setDate(endDate.getDate() + plan.duration);
-
-  if (activeMembership) {
-    // Extend the active membership by the new plan's duration.
-    activeMembership.endDate = endDate;
-
-    await activeMembership.save();
-
-    // Link the payment to the membership it extended.
-    payment.membership = activeMembership._id;
-
-    await payment.save();
-
-    return activeMembership;
-  }
-
-  const membership = await Membership.create({
-    member: memberId,
-    plan: plan._id,
-    startDate,
-    endDate,
-    status: "active",
-  });
-
-  // Link the payment to the membership it created.
-  payment.membership = membership._id;
-
-  await payment.save();
-
-  return membership;
-};
-
-/*
-|--------------------------------------------------------------------------
-| Notifies the member's login account about a payment update.
-|--------------------------------------------------------------------------
-*/
-
-const notifyMemberUser = async (memberId, title, message) => {
   try {
-    const member = await Member.findById(memberId).select("user");
+    await session.withTransaction(async () => {
+      const currentPayment = await Payment.findById(
+        payment._id
+      ).session(session);
 
-    if (member?.user) {
-      await Notification.create({
-        recipient: member.user,
-        type: "payment",
-        title,
-        message,
-      });
-    }
-  } catch (error) {
-    console.error("Payment notification error:", error.message);
+      if (!currentPayment || currentPayment.status === "rejected" || currentPayment.membershipActivatedAt) {
+        return;
+      }
+
+      const now = new Date();
+      let membership;
+      let plan;
+
+      if (currentPayment.membership) {
+        membership = await Membership.findOne({
+          _id: currentPayment.membership,
+          member: currentPayment.member,
+        }).session(session);
+
+        if (!membership) return;
+
+        plan = await MembershipPlan.findById(
+          membership.plan
+        ).session(session);
+
+        if (!plan) return;
+
+        const hasCurrentAccess = isMembershipCurrent(
+          membership,
+          now
+        );
+        const { startDate, endDate } =
+          getMembershipExtensionDates(
+            membership,
+            plan.duration,
+            now
+          );
+
+        if (!hasCurrentAccess) {
+          membership.startDate = startDate;
+        }
+        membership.endDate = endDate;
+        membership.status = "active";
+      } else if (currentPayment.plan) {
+        plan = await MembershipPlan.findById(
+          currentPayment.plan
+        ).session(session);
+
+        if (!plan) return;
+
+        membership = await Membership.findOne({
+          member: currentPayment.member,
+          status: "active",
+          endDate: { $gte: now },
+        })
+          .sort({ endDate: -1 })
+          .session(session);
+
+        const { startDate, endDate } =
+          getMembershipExtensionDates(
+            membership,
+            plan.duration,
+            now
+          );
+
+        if (membership) {
+          membership.plan = plan._id;
+          membership.endDate = endDate;
+        } else {
+          membership = new Membership({
+            member: currentPayment.member,
+            plan: plan._id,
+            startDate,
+            endDate,
+            status: "active",
+          });
+        }
+      } else {
+        return;
+      }
+
+      if (auditEvent?.action === "payment.approved") {
+        currentPayment.status = "paid";
+        currentPayment.verifiedBy = auditEvent.actor;
+        currentPayment.verifiedAt = now;
+        currentPayment.reviewedBy = auditEvent.actor;
+        currentPayment.reviewedAt = now;
+        currentPayment.rejectionReason = null;
+      } else if (auditEvent?.action === "payment.chapa_confirmed") {
+        currentPayment.status = "paid";
+        currentPayment.paymentDate = now;
+      }
+
+      await membership.save({ session });
+      currentPayment.membership = membership._id;
+      currentPayment.membershipActivatedAt = now;
+      await currentPayment.save({ session });
+
+      if (auditEvent) {
+        await recordAuditEvent({
+          ...auditEvent,
+          subjectType: "Payment",
+          subjectId: currentPayment._id,
+          member: currentPayment.member,
+        }, { session });
+      }
+
+      if (auditEvent?.notification) {
+        await enqueueMemberNotification(
+          currentPayment.member,
+          auditEvent.notification,
+          session
+        );
+      }
+      activated = true;
+    });
+  } finally {
+    await session.endSession();
   }
+
+  return activated;
 };
 
 /*
@@ -320,6 +376,7 @@ const getPayments = async (req, res) => {
     const payments = await Payment.find(filter)
       .populate("member", "name email")
       .populate("plan", "name price duration")
+      .populate("reviewedBy", "name")
       .populate({
         path: "membership",
         populate: {
@@ -350,6 +407,7 @@ const getPaymentById = async (req, res) => {
     const payment = await Payment.findById(req.params.id)
       .populate("member", "name email phone")
       .populate("plan", "name price duration")
+      .populate("reviewedBy", "name")
       .populate({
         path: "membership",
         populate: {
@@ -649,18 +707,37 @@ const createPayment = async (req, res) => {
     |--------------------------------------------------------------------------
     */
 
-    const payment = await Payment.create({
-      member: memberId,
-      membership: membershipId || undefined,
-      plan: planId || undefined,
-      amount: paymentAmount,
-      paymentMethod,
-      proofImage: uploadedProof?.secure_url || null,
-      proofImagePublicId: uploadedProof?.public_id || null,
-      status:
-        req.user.role === "member"
-          ? "pending"
-          : "paid",
+    const payment = await withAuditTransaction(async (session) => {
+      const [createdPayment] = await Payment.create(
+        [{
+          member: memberId,
+          membership: membershipId || undefined,
+          plan: planId || undefined,
+          amount: paymentAmount,
+          paymentMethod,
+          proofImage: uploadedProof?.secure_url || null,
+          proofImagePublicId: uploadedProof?.public_id || null,
+          status: req.user.role === "member" ? "pending" : "paid",
+        }],
+        { session }
+      );
+
+      await recordAuditEvent({
+        actor: req.user.userId,
+        actorRole: req.user.role,
+        action: "payment.created",
+        subjectType: "Payment",
+        subjectId: createdPayment._id,
+        member: member._id,
+        summary: `Payment of ${paymentAmount} ETB recorded as ${createdPayment.status}.`,
+        metadata: {
+          amount: paymentAmount,
+          paymentMethod,
+          status: createdPayment.status,
+        },
+      }, { session });
+
+      return createdPayment;
     });
 
     /*
@@ -727,11 +804,7 @@ const initializeChapaPayment = async (req, res) => {
       });
     }
 
-    const {
-      membershipId,
-      planId,
-      amount,
-    } = req.body;
+    const { membershipId, planId } = req.body;
 
     /*
     |--------------------------------------------------------------------------
@@ -786,20 +859,12 @@ const initializeChapaPayment = async (req, res) => {
       |--------------------------------------------------------------------------
       */
 
-      const paymentAmountFromBody = Number(amount);
-
-      if (
-        !mongoose.isValidObjectId(membershipId) ||
-        !Number.isFinite(paymentAmountFromBody) ||
-        paymentAmountFromBody <= 0
-      ) {
+      if (!mongoose.isValidObjectId(membershipId)) {
         return res.status(400).json({
           message:
-            "A valid membership and positive amount are required.",
+            "A valid membership is required.",
         });
       }
-
-      paymentAmount = paymentAmountFromBody;
 
       context = await getMemberPaymentContext(
         req,
@@ -812,6 +877,14 @@ const initializeChapaPayment = async (req, res) => {
           .json({
             message: context.error.message,
           });
+      }
+
+      paymentAmount = context.membership.plan?.price;
+
+      if (!Number.isFinite(Number(paymentAmount)) || paymentAmount <= 0) {
+        return res.status(400).json({
+          message: "The membership plan has an invalid price.",
+        });
       }
     }
 
@@ -840,18 +913,6 @@ const initializeChapaPayment = async (req, res) => {
 
     const transactionReference =
       `gym_${crypto.randomUUID()}`;
-
-    const payment = await Payment.create({
-      member: payingMember._id,
-      membership: context
-        ? context.membership._id
-        : undefined,
-      plan: plan ? plan._id : undefined,
-      amount: paymentAmount,
-      paymentMethod: "chapa",
-      status: "pending",
-      transactionReference,
-    });
 
     /*
     |--------------------------------------------------------------------------
@@ -903,7 +964,7 @@ const initializeChapaPayment = async (req, res) => {
             `${serverUrl}/api/payments/chapa/callback`,
 
           return_url:
-            `${clientUrl}/dashboard/member/payments?payment=${payment._id}&status=success`,
+            `${clientUrl}/dashboard/member/payments?payment=${encodeURIComponent(transactionReference)}&status=success`,
 
           customization: {
             title: "Gym membership payment",
@@ -924,14 +985,44 @@ const initializeChapaPayment = async (req, res) => {
       chapaData?.data?.checkout_url;
 
     if (!chapaResponse.ok || !checkoutUrl) {
-      await Payment.findByIdAndDelete(payment._id);
-
       return res.status(502).json({
         message:
           chapaData?.message ||
           "Chapa could not initialize the payment.",
       });
     }
+
+    const payment = await withAuditTransaction(async (session) => {
+      const [createdPayment] = await Payment.create(
+        [{
+          member: payingMember._id,
+          membership: context ? context.membership._id : undefined,
+          plan: plan ? plan._id : undefined,
+          amount: paymentAmount,
+          paymentMethod: "chapa",
+          status: "pending",
+          transactionReference,
+        }],
+        { session }
+      );
+
+      await recordAuditEvent({
+        actor: req.user.userId,
+        actorRole: req.user.role,
+        action: "payment.initialized",
+        subjectType: "Payment",
+        subjectId: createdPayment._id,
+        member: payingMember._id,
+        summary: `Chapa checkout initialized for ${createdPayment.amount} ETB.`,
+        metadata: {
+          amount: createdPayment.amount,
+          paymentMethod: "chapa",
+          transactionReference,
+        },
+      }, { session });
+
+      return createdPayment;
+    });
 
     res.status(201).json({
       paymentId: payment._id,
@@ -986,6 +1077,13 @@ const chapaCallback = async (req, res) => {
       });
     }
 
+    if (payment.membershipActivatedAt) {
+      return res.json({
+        message: "Payment and membership are already confirmed.",
+        status: payment.status,
+      });
+    }
+
     const verifyResponse = await fetch(
       `https://api.chapa.co/v1/transaction/verify/${encodeURIComponent(
         transactionReference
@@ -1008,21 +1106,40 @@ const chapaCallback = async (req, res) => {
         payment.amount
       );
 
+    let confirmedPayment = payment;
+
     if (isSuccessful) {
-      payment.status = "paid";
-      payment.paymentDate = new Date();
+      const activated = await activateMembershipForPayment(payment, {
+        actor: null,
+        actorRole: "system",
+        action: "payment.chapa_confirmed",
+        summary: `Chapa confirmed payment of ${payment.amount} ETB.`,
+        metadata: {
+          amount: payment.amount,
+          transactionReference: payment.transactionReference,
+        },
+        notification: {
+          eventKey: `payment-chapa-confirmed:${payment._id}`,
+          type: "payment",
+          title: "Payment confirmed",
+          message: `Your Chapa payment of ${payment.amount} ETB was confirmed. Your membership is now active.`,
+        },
+      });
 
-      await payment.save();
+      if (!activated) {
+        confirmedPayment = await Payment.findById(payment._id);
+      }
 
-      /*
-      |--------------------------------------------------------------------------
-      | Self-service plan payments activate/extend membership.
-      |--------------------------------------------------------------------------
-      */
+      if (!activated && !confirmedPayment?.membershipActivatedAt) {
+        return res.status(409).json({
+          message: "Payment confirmation could not be applied to a membership.",
+          status: payment.status,
+        });
+      }
 
-      await activateMembershipForPayment(
-        payment
-      );
+      if (activated) {
+        confirmedPayment = await Payment.findById(payment._id);
+      }
     }
 
     res
@@ -1031,7 +1148,7 @@ const chapaCallback = async (req, res) => {
         message: isSuccessful
           ? "Payment verified successfully."
           : "Payment could not be verified.",
-        status: payment.status,
+        status: confirmedPayment.status,
       });
   } catch (error) {
     console.error(
@@ -1214,10 +1331,18 @@ const verifyPayment = async (req, res) => {
       });
     }
 
-    if (payment.status === "paid") {
+    const alreadyPaid = payment.status === "paid";
+
+    if (
+      payment.status === "rejected" ||
+      (alreadyPaid &&
+        (payment.membershipActivatedAt || decision === "rejected"))
+    ) {
       return res.status(400).json({
         message:
-          "This payment has already been confirmed.",
+          payment.status === "rejected"
+            ? "This payment was rejected. Submit a new payment for review."
+            : "This payment has already been confirmed.",
       });
     }
 
@@ -1228,43 +1353,53 @@ const verifyPayment = async (req, res) => {
     */
 
     if (decision === "approved") {
-      payment.status = "paid";
-      payment.verifiedBy =
-        req.user.userId;
-      payment.verifiedAt = new Date();
-      payment.rejectionReason = null;
+      const memberId = payment.member._id || payment.member;
+      const activated = await activateMembershipForPayment(payment, {
+        actor: req.user.userId,
+        actorRole: req.user.role,
+        action: "payment.approved",
+        summary: `Payment of ${payment.amount} ETB approved.`,
+        metadata: {
+          amount: payment.amount,
+          paymentMethod: payment.paymentMethod,
+        },
+        notification: {
+          eventKey: `payment-approved:${payment._id}`,
+          type: "payment",
+          title: "Payment approved",
+          message: payment.plan
+            ? `Your ${payment.paymentMethod} payment of ${payment.amount} ETB was approved. Your ${planLabel(payment)} is now active. Welcome aboard!`
+            : `Your ${payment.paymentMethod} payment of ${payment.amount} ETB was approved by the gym. Thank you!`,
+        },
+      });
 
-      await payment.save();
+      if (!activated) {
+        const confirmedPayment = await Payment.findById(payment._id)
+          .populate("member", "name email")
+          .populate("plan", "name price duration");
 
-      /*
-      |--------------------------------------------------------------------------
-      | Self-service payment activates/extends membership.
-      |--------------------------------------------------------------------------
-      */
+        if (confirmedPayment?.membershipActivatedAt) {
+          return res.json({
+            message: "Payment and membership are already confirmed.",
+            payment: confirmedPayment,
+          });
+        }
 
-      await activateMembershipForPayment(
-        payment
-      );
+        return res.status(409).json({
+          message: "Payment could not be applied to a membership. No changes were saved.",
+        });
+      }
 
-      await notifyMemberUser(
-        payment.member._id ||
-          payment.member,
-
-        "Payment approved",
-
-        payment.plan
-          ? `Your ${payment.paymentMethod} payment of ${payment.amount} ETB was approved. Your ${planLabel(
-              payment
-            )} is now active. Welcome aboard!`
-          : `Your ${payment.paymentMethod} payment of ${payment.amount} ETB was approved by the gym. Thank you!`
-      );
+      const confirmedPayment = await Payment.findById(payment._id)
+        .populate("member", "name email")
+        .populate("plan", "name price duration");
 
       return res.json({
         message: payment.plan
           ? "Payment approved. The member's plan membership is now active."
           : "Payment approved and marked as paid.",
 
-        payment,
+        payment: confirmedPayment,
       });
     }
 
@@ -1287,44 +1422,53 @@ const verifyPayment = async (req, res) => {
     const amount =
       payment.amount;
 
-    const proofPublicId =
-      payment.proofImagePublicId;
+    const rejectionReason =
+      typeof reason === "string" ? reason.trim().slice(0, 500) : "";
 
-    await removeProofFile(
-      proofPublicId
-    );
+    const rejectedPayment = await withAuditTransaction(async (session) => {
+      const currentPayment = await Payment.findById(payment._id).session(session);
+      if (!currentPayment || currentPayment.status !== "pending") {
+        const error = new Error("Payment is no longer pending review.");
+        error.statusCode = 409;
+        throw error;
+      }
 
-    /*
-    |--------------------------------------------------------------------------
-    | Delete payment record.
-    |--------------------------------------------------------------------------
-    */
+      currentPayment.status = "rejected";
+      currentPayment.reviewedBy = req.user.userId;
+      currentPayment.reviewedAt = new Date();
+      currentPayment.rejectionReason = rejectionReason || null;
+      await currentPayment.save({ session });
 
-    await Payment.findByIdAndDelete(
-      payment._id
-    );
+      await recordAuditEvent({
+        actor: req.user.userId,
+        actorRole: req.user.role,
+        action: "payment.rejected",
+        subjectType: "Payment",
+        subjectId: currentPayment._id,
+        member: memberId,
+        summary: `Payment of ${amount} ETB rejected.`,
+        metadata: {
+          amount,
+          paymentMethod: method,
+          rejectionReason: rejectionReason || null,
+        },
+      }, { session });
 
-    /*
-    |--------------------------------------------------------------------------
-    | Notify member.
-    |--------------------------------------------------------------------------
-    */
+      await enqueueMemberNotification(memberId, {
+        eventKey: `payment-rejected:${currentPayment._id}`,
+        type: "payment",
+        title: "Payment rejected",
+        message: `Your ${method} payment of ${amount} ETB was rejected.${
+          rejectionReason ? ` Reason: ${rejectionReason}.` : ""
+        } Please submit a new payment with a valid transfer screenshot.`,
+      }, session);
 
-    await notifyMemberUser(
-      memberId,
-
-      "Payment rejected",
-
-      `Your ${method} payment of ${amount} ETB was rejected.${
-        reason
-          ? ` Reason: ${reason}.`
-          : ""
-      } Please submit a new payment with a valid transfer screenshot.`
-    );
+      return currentPayment;
+    });
 
     res.json({
-      message:
-        "Payment rejected and removed.",
+      message: "Payment rejected and retained in payment history.",
+      payment: rejectedPayment,
     });
   } catch (error) {
     console.error(
@@ -1332,9 +1476,8 @@ const verifyPayment = async (req, res) => {
       error
     );
 
-    res.status(500).json({
-      message:
-        "Server error while verifying payment.",
+    res.status(error.statusCode || 500).json({
+      message: error.statusCode ? error.message : "Server error while verifying payment.",
     });
   }
 };

@@ -30,6 +30,8 @@ import MemberAnnouncements from "./pages/MemberAnnouncements";
 import Reviews from "./pages/Reviews";
 import MemberReviews from "./pages/MemberReviews";
 import MemberNotifications from "./pages/MemberNotifications";
+import AuditLogs from "./pages/AuditLogs";
+import OwnerReports from "./pages/OwnerReports";
 
 function App() {
   return (
@@ -59,6 +61,22 @@ function App() {
         element={
           <RoleRoute allow={["owner"]}>
             <TrainerApprovals />
+          </RoleRoute>
+        }
+      />
+      <Route
+        path="/owner/audit"
+        element={
+          <RoleRoute allow={["owner"]}>
+            <AuditLogs />
+          </RoleRoute>
+        }
+      />
+      <Route
+        path="/owner/reports"
+        element={
+          <RoleRoute allow={["owner"]}>
+            <OwnerReports />
           </RoleRoute>
         }
       />

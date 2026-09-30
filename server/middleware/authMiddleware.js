@@ -1,6 +1,9 @@
 const jwt = require("jsonwebtoken");
+const Member = require("../models/Member");
 
-const protect = (req, res, next) => {
+const protect = async (req, res, next) => {
+  let decoded;
+
   try {
     const authHeader = req.headers.authorization;
 
@@ -28,15 +31,10 @@ const protect = (req, res, next) => {
     }
 
     // Verify token
-    const decoded = jwt.verify(
+    decoded = jwt.verify(
       token,
       process.env.JWT_SECRET
     );
-
-    // Attach authenticated user to request
-    req.user = decoded;
-
-    next();
   } catch (error) {
     console.error(
       "Authentication error:",
@@ -47,6 +45,28 @@ const protect = (req, res, next) => {
       message: "Not authorized. Invalid or expired token.",
     });
   }
+
+  if (decoded.role === "member") {
+    try {
+      const member = await Member.findOne({
+        user: decoded.userId,
+      }).select("status archivedAt");
+
+      if (member && (member.status !== "active" || member.archivedAt)) {
+        return res.status(403).json({
+          message: "This member account is inactive. Please contact the gym.",
+        });
+      }
+    } catch (error) {
+      console.error("Member account status check failed:", error.message);
+      return res.status(500).json({
+        message: "Could not verify member account status.",
+      });
+    }
+  }
+
+  req.user = decoded;
+  next();
 };
 
 module.exports = protect;

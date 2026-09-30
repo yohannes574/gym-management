@@ -12,6 +12,24 @@ const attendanceSchema = new mongoose.Schema(
       type: Date,
       default: Date.now,
     },
+
+    isOverride: {
+      type: Boolean,
+      default: false,
+    },
+
+    overrideReason: {
+      type: String,
+      trim: true,
+      maxlength: [500, "Override reason cannot exceed 500 characters."],
+      default: null,
+    },
+
+    overrideBy: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "User",
+      default: null,
+    },
   },
   {
     timestamps: true,

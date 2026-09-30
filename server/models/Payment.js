@@ -71,9 +71,26 @@ const paymentSchema = new mongoose.Schema(
       default: null,
     },
 
+    reviewedBy: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "User",
+      default: null,
+    },
+
+    reviewedAt: {
+      type: Date,
+      default: null,
+    },
+
     rejectionReason: {
       type: String,
       trim: true,
+      maxlength: [500, "Rejection reason cannot exceed 500 characters."],
+      default: null,
+    },
+
+    membershipActivatedAt: {
+      type: Date,
       default: null,
     },
 
@@ -85,7 +102,7 @@ const paymentSchema = new mongoose.Schema(
     status: {
       type: String,
       enum: {
-        values: ["paid", "pending"],
+        values: ["paid", "pending", "rejected"],
         message: "Invalid payment status.",
       },
       default: "paid",

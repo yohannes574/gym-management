@@ -19,29 +19,11 @@ protect,
 authorize("owner", "receptionist"),
 async (req, res) => {
 try {
-// --------------------------------
-// UPDATE EXPIRED MEMBERSHIPS
-// --------------------------------
-
-  const now = new Date();
-
-  await Membership.updateMany(
-    {
-      status: "active",
-      endDate: {
-        $lt: now,
-      },
-    },
-    {
-      status: "expired",
-    }
-  );
-
   // --------------------------------
   // BASIC STATISTICS
   // --------------------------------
 
-  const totalMembers = await Member.countDocuments();
+  const totalMembers = await Member.countDocuments({ archivedAt: null });
 
   const activeMemberships = await Membership.countDocuments({
     status: "active",

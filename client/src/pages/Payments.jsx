@@ -350,6 +350,16 @@ function Payments() {
                         <span className={`status-badge ${payment.status}`}>
                           {payment.status}
                         </span>
+                        {payment.rejectionReason && (
+                          <p className="muted-text">
+                            {payment.rejectionReason}
+                          </p>
+                        )}
+                        {payment.reviewedBy?.name && (
+                          <p className="muted-text">
+                            Reviewed by {payment.reviewedBy.name}
+                          </p>
+                        )}
                       </td>
                       <td>
                         {payment.proofImage ? (
@@ -491,7 +501,7 @@ function Payments() {
                 Reject <strong>{rejecting.member?.name}</strong>'s{" "}
                 <span className="capitalize">{rejecting.paymentMethod}</span>{" "}
                 payment of {rejecting.amount} ETB? The member will be asked to
-                submit a new payment.
+                submit a new payment. This review will remain in payment history.
               </p>
 
               <textarea

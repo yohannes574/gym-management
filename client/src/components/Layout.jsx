@@ -18,6 +18,7 @@ import {
   Dumbbell as DumbbellIcon,
   TrendingUp,
   Bell,
+  BarChart3,
   LogOut,
   Menu,
   X,
@@ -40,6 +41,8 @@ function Layout({ children }) {
         label: "Overview",
         links: [
           { to: "/dashboard/owner", icon: LayoutDashboard, label: "Dashboard" },
+          { to: "/owner/reports", icon: BarChart3, label: "Reports" },
+          { to: "/owner/audit", icon: ClipboardList, label: "Audit History" },
         ],
       },
       {

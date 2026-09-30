@@ -22,6 +22,11 @@ const notificationSchema = new mongoose.Schema(
       required: [true, "Notification message is required."],
       trim: true,
     },
+    dedupeKey: {
+      type: String,
+      trim: true,
+      default: undefined,
+    },
     readAt: {
       type: Date,
       default: null,
@@ -31,5 +36,6 @@ const notificationSchema = new mongoose.Schema(
 );
 
 notificationSchema.index({ recipient: 1, createdAt: -1 });
+notificationSchema.index({ dedupeKey: 1 }, { unique: true, sparse: true });
 
 module.exports = mongoose.model("Notification", notificationSchema);

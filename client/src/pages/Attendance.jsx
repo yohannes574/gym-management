@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useEffectEvent, useState } from "react";
 import { UserCheck, History, AlertCircle } from "lucide-react";
 import Layout from "../components/Layout";
 import { apiFetch } from "../api/api";
@@ -7,6 +7,7 @@ function Attendance() {
 const [members, setMembers] = useState([]);
 const [attendance, setAttendance] = useState([]);
 const [memberId, setMemberId] = useState("");
+const [overrideReason, setOverrideReason] = useState("");
 const [message, setMessage] = useState("");
 
 // Fetch all members
@@ -54,9 +55,13 @@ const response = await apiFetch("/attendance");
 };
 
 // Load data
+const loadInitialData = useEffectEvent(() => {
+  fetchMembers();
+  fetchAttendance();
+});
+
 useEffect(() => {
-fetchMembers();
-fetchAttendance();
+  queueMicrotask(() => loadInitialData());
 }, []);
 
 // Check in member
@@ -74,6 +79,7 @@ try {
     method: "POST",
     body: JSON.stringify({
       memberId,
+      overrideReason,
     }),
   });
 
@@ -84,9 +90,15 @@ try {
     return;
   }
 
-  setMessage("Member checked in successfully!");
+  setMessage(
+    data.message ||
+      (overrideReason.trim()
+        ? "Check-in recorded with staff override."
+        : "Member checked in successfully!")
+  );
 
   setMemberId("");
+  setOverrideReason("");
 
   fetchAttendance();
 } catch (error) {
@@ -140,6 +152,19 @@ return ( <Layout> <div className="dashboard-page"> <div className="page-header">
             </option>
           ))}
         </select>
+        <div>
+          <label htmlFor="attendance-override-reason">
+            Membership exception reason
+          </label>
+          <input
+            id="attendance-override-reason"
+            type="text"
+            maxLength={500}
+            placeholder="Leave blank for a regular check-in"
+            value={overrideReason}
+            onChange={(e) => setOverrideReason(e.target.value)}
+          />
+        </div>
       </div>
 
       <br />
@@ -168,6 +193,7 @@ return ( <Layout> <div className="dashboard-page"> <div className="page-header">
               <th>Email</th>
               <th>Check-In Date</th>
               <th>Check-In Time</th>
+              <th>Exception</th>
             </tr>
           </thead>
 
@@ -193,6 +219,17 @@ return ( <Layout> <div className="dashboard-page"> <div className="page-header">
 
                   <td>
                     {checkInDate.toLocaleTimeString()}
+                  </td>
+                  <td>
+                    {record.isOverride ? (
+                      <>
+                        <span className="status-badge status-rejected">Override</span>
+                        <p className="muted-text">{record.overrideReason}</p>
+                        <p className="muted-text">By {record.overrideBy?.name || "Staff"}</p>
+                      </>
+                    ) : (
+                      <span className="muted-text">Standard</span>
+                    )}
                   </td>
                 </tr>
               );

@@ -26,7 +26,7 @@ function MemberPayments() {
   const [justPaid, setJustPaid] = useState(false);
 
   // Pay-now form
-  const [planId, setPlanId] = useState("");
+  const [planId, setPlanId] = useState(searchParams.get("plan") || "");
   const [paymentMethod, setPaymentMethod] = useState("bank");
   // Screenshot of the transfer, required for bank / Telebirr payments.
   const [proofFile, setProofFile] = useState(null);
@@ -362,6 +362,11 @@ function MemberPayments() {
                           >
                             {p.status}
                           </span>
+                          {p.rejectionReason && (
+                            <p className="muted-text">
+                              {p.rejectionReason}
+                            </p>
+                          )}
                         </td>
                         <td>
                           <Link
