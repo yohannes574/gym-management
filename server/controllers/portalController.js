@@ -21,16 +21,6 @@ const getMemberPortal = async (req, res) => {
       });
     }
 
-    // Expire this member's finished memberships
-    await Membership.updateMany(
-      {
-        member: member._id,
-        status: "active",
-        endDate: { $lt: new Date() },
-      },
-      { status: "expired" }
-    );
-
     const memberships = await Membership.find({
       member: member._id,
     })

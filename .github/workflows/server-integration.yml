@@ -1,0 +1,68 @@
+name: Server Integration Tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  server-integration:
+    runs-on: ubuntu-latest
+    env:
+      TEST_MONGO_URI: mongodb://127.0.0.1:27017/gym-platform-test?replicaSet=rs0
+      JWT_SECRET: ci-only-integration-test-secret
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: server/package-lock.json
+
+      - name: Install server dependencies
+        run: npm ci --prefix server
+
+      - name: Start MongoDB replica set
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --detach --name test-mongo --publish 27017:27017 mongo:7.0 --replSet rs0 --bind_ip_all
+
+          ready=false
+          for attempt in $(seq 1 30); do
+            if docker exec test-mongo mongosh --quiet --eval 'db.adminCommand({ ping: 1 }).ok' 2>/dev/null | grep -q '1'; then
+              ready=true
+              break
+            fi
+            sleep 1
+          done
+
+          if [ "$ready" != "true" ]; then
+            docker logs test-mongo
+            exit 1
+          fi
+
+          docker exec test-mongo mongosh --quiet --eval 'rs.initiate({ _id: "rs0", members: [{ _id: 0, host: "localhost:27017" }] })'
+
+          primary=false
+          for attempt in $(seq 1 30); do
+            if docker exec test-mongo mongosh --quiet --eval 'db.hello().isWritablePrimary' 2>/dev/null | grep -q 'true'; then
+              primary=true
+              break
+            fi
+            sleep 1
+          done
+
+          if [ "$primary" != "true" ]; then
+            docker logs test-mongo
+            exit 1
+          fi
+
+      - name: Run server tests
+        run: npm test --prefix server

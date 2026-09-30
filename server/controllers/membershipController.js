@@ -1,25 +1,14 @@
 const Membership = require("../models/Membership");
 const Member = require("../models/Member");
 const MembershipPlan = require("../models/MembershipPlan");
+const {
+  recordAuditEvent,
+  withAuditTransaction,
+} = require("../services/auditLogService");
 
 // GET all memberships
 const getMemberships = async (req, res) => {
   try {
-    // Automatically expire old memberships
-    await Membership.updateMany(
-      {
-        status: "active",
-        endDate: {
-          $lt: new Date(),
-        },
-      },
-      {
-        $set: {
-          status: "expired",
-        },
-      }
-    );
-
     // Get all memberships
     const memberships = await Membership.find()
       .populate("member", "name email phone")
@@ -78,12 +67,30 @@ const createMembership = async (req, res) => {
     );
 
     // Create membership
-    const membership = await Membership.create({
-      member: memberId,
-      plan: planId,
-      startDate: membershipStartDate,
-      endDate: membershipEndDate,
-      status: "active",
+    const membership = await withAuditTransaction(async (session) => {
+      const [createdMembership] = await Membership.create(
+        [{
+          member: memberId,
+          plan: planId,
+          startDate: membershipStartDate,
+          endDate: membershipEndDate,
+          status: "active",
+        }],
+        { session }
+      );
+
+      await recordAuditEvent({
+        actor: req.user.userId,
+        actorRole: req.user.role,
+        action: "membership.created",
+        subjectType: "Membership",
+        subjectId: createdMembership._id,
+        member: member._id,
+        summary: `${plan.name} membership assigned to ${member.name}.`,
+        metadata: { planId: plan._id, startDate: membershipStartDate },
+      }, { session });
+
+      return createdMembership;
     });
 
     // Populate member information
@@ -110,15 +117,28 @@ const createMembership = async (req, res) => {
 
 const cancelMembership = async (req, res) => {
   try {
-    const membership = await Membership.findByIdAndUpdate(
-      req.params.id,
-      {
-        status: "cancelled",
-      },
-      {
-        new: true,
-      }
-    );
+    const membership = await withAuditTransaction(async (session) => {
+      const currentMembership = await Membership.findById(
+        req.params.id
+      ).session(session);
+
+      if (!currentMembership) return null;
+
+      currentMembership.status = "cancelled";
+      await currentMembership.save({ session });
+
+      await recordAuditEvent({
+        actor: req.user.userId,
+        actorRole: req.user.role,
+        action: "membership.cancelled",
+        subjectType: "Membership",
+        subjectId: currentMembership._id,
+        member: currentMembership.member,
+        summary: "Membership cancelled by staff.",
+      }, { session });
+
+      return currentMembership;
+    });
 
     if (!membership) {
       return res.status(404).json({
@@ -141,48 +161,54 @@ const cancelMembership = async (req, res) => {
 
 const renewMembership = async (req, res) => {
   try {
-    const membership = await Membership.findById(req.params.id)
-      .populate("plan");
+    if (req.user.role === "member") {
+      const self = await Member.findOne({ user: req.user.userId });
+      const target = await Membership.findById(req.params.id).select("member");
+
+      if (!self || !target || target.member.toString() !== self._id.toString()) {
+        return res.status(403).json({
+          message: "You can only renew your own membership.",
+        });
+      }
+    }
+
+    const membership = await withAuditTransaction(async (session) => {
+      const currentMembership = await Membership.findById(req.params.id)
+        .populate("plan")
+        .session(session);
+
+      if (!currentMembership) return null;
+
+      const newStartDate = new Date();
+      const newEndDate = new Date(newStartDate);
+      newEndDate.setDate(
+        newEndDate.getDate() + currentMembership.plan.duration
+      );
+
+      currentMembership.startDate = newStartDate;
+      currentMembership.endDate = newEndDate;
+      currentMembership.status = "active";
+      await currentMembership.save({ session });
+
+      await recordAuditEvent({
+        actor: req.user.userId,
+        actorRole: req.user.role,
+        action: "membership.renewed",
+        subjectType: "Membership",
+        subjectId: currentMembership._id,
+        member: currentMembership.member,
+        summary: `${currentMembership.plan.name} membership renewed by staff.`,
+        metadata: { startDate: newStartDate, endDate: newEndDate },
+      }, { session });
+
+      return currentMembership;
+    });
 
     if (!membership) {
       return res.status(404).json({
         message: "Membership not found.",
       });
     }
-
-    // Members can only renew their own membership
-    if (req.user.role === "member") {
-      const self = await Member.findOne({
-        user: req.user.userId,
-      });
-
-      if (
-        !self ||
-        membership.member.toString() !== self._id.toString()
-      ) {
-        return res.status(403).json({
-          message:
-            "You can only renew your own membership.",
-        });
-      }
-    }
-
-    // Start the renewed membership today
-    const newStartDate = new Date();
-
-    // Calculate new end date using plan duration
-    const newEndDate = new Date(newStartDate);
-
-    newEndDate.setDate(
-      newEndDate.getDate() + membership.plan.duration
-    );
-
-    // Update membership
-    membership.startDate = newStartDate;
-    membership.endDate = newEndDate;
-    membership.status = "active";
-
-    await membership.save();
 
     res.json({
       message: "Membership renewed successfully!",

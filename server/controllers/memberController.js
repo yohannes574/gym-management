@@ -1,10 +1,20 @@
+const mongoose = require("mongoose");
 const Member = require("../models/Member");
 const Membership = require("../models/Membership");
+const TrainerAssignment = require("../models/TrainerAssignment");
+const TrainingSession = require("../models/TrainingSession");
+const {
+  recordAuditEvent,
+  withAuditTransaction,
+} = require("../services/auditLogService");
 
 // GET all members
 const getMembers = async (req, res) => {
 try {
-const members = await Member.find().sort({
+const filter = req.query.includeArchived === "true"
+  ? {}
+  : { archivedAt: null };
+const members = await Member.find(filter).sort({
 createdAt: -1,
 });
 
@@ -44,11 +54,23 @@ if (existingMember) {
   });
 }
 
-const member = await Member.create({
-  name,
-  email,
-  phone,
-  gender,
+const member = await withAuditTransaction(async (session) => {
+  const [createdMember] = await Member.create(
+    [{ name, email, phone, gender }],
+    { session }
+  );
+
+  await recordAuditEvent({
+    actor: req.user.userId,
+    actorRole: req.user.role,
+    action: "member.created",
+    subjectType: "Member",
+    subjectId: createdMember._id,
+    member: createdMember._id,
+    summary: `${createdMember.name} added by staff.`,
+  }, { session });
+
+  return createdMember;
 });
 
 res.status(201).json(member);
@@ -82,55 +104,92 @@ res.status(500).json({
 }
 };
 
-// DELETE member
+// Archive member while preserving related history
 const deleteMember = async (req, res) => {
-try {
-const member = await Member.findByIdAndDelete(
-req.params.id
-);
+  const session = await mongoose.startSession();
+  let member;
 
+  try {
+    await session.withTransaction(async () => {
+      member = await Member.findById(req.params.id).session(session);
 
-if (!member) {
-  return res.status(404).json({
-    message: "Member not found.",
-  });
-}
+      if (!member || member.archivedAt) return;
 
-res.json({
-  message: "Member deleted successfully.",
-});
+      member.status = "inactive";
+      member.archivedAt = new Date();
+      await member.save({ session });
 
+      await Membership.updateMany(
+        { member: member._id, status: "active" },
+        { $set: { status: "cancelled" } },
+        { session }
+      );
+      await TrainerAssignment.updateMany(
+        { member: member._id, status: "active" },
+        { $set: { status: "inactive" } },
+        { session }
+      );
+      await TrainingSession.updateMany(
+        { member: member._id, status: "scheduled" },
+        { $set: { status: "cancelled" } },
+        { session }
+      );
+      await recordAuditEvent({
+        actor: req.user.userId,
+        actorRole: req.user.role,
+        action: "member.archived",
+        subjectType: "Member",
+        subjectId: member._id,
+        member: member._id,
+        summary: `${member.name} archived by staff.`,
+      }, { session });
+    });
 
-} catch (error) {
-console.error("Delete member error:", error);
+    if (!member) {
+      return res.status(404).json({ message: "Member not found." });
+    }
 
-
-res.status(500).json({
-  message: "Server error while deleting member.",
-});
-
-
-}
+    res.json({ message: "Member archived successfully.", member });
+  } catch (error) {
+    console.error("Archive member error:", error);
+    res.status(500).json({
+      message: "Server error while archiving member.",
+    });
+  } finally {
+    await session.endSession();
+  }
 };
 
 const updateMember = async (req, res) => {
 try {
 const { name, email, phone, status } = req.body;
+const member = await withAuditTransaction(async (session) => {
+  const currentMember = await Member.findById(req.params.id).session(session);
+  if (!currentMember) return null;
 
+  const wasArchived = Boolean(currentMember.archivedAt);
+  if (name !== undefined) currentMember.name = name;
+  if (email !== undefined) currentMember.email = email;
+  if (phone !== undefined) currentMember.phone = phone;
+  if (status !== undefined) currentMember.status = status;
 
-const member = await Member.findByIdAndUpdate(
-  req.params.id,
-  {
-    name,
-    email,
-    phone,
-    status,
-  },
-  {
-    returnDocument: "after",
-    runValidators: true,
+  if (status === "active") currentMember.archivedAt = null;
+  await currentMember.save({ session });
+
+  if (wasArchived && currentMember.status === "active") {
+    await recordAuditEvent({
+      actor: req.user.userId,
+      actorRole: req.user.role,
+      action: "member.restored",
+      subjectType: "Member",
+      subjectId: currentMember._id,
+      member: currentMember._id,
+      summary: `${currentMember.name} restored by staff.`,
+    }, { session });
   }
-);
+
+  return currentMember;
+});
 
 if (!member) {
   return res.status(404).json({

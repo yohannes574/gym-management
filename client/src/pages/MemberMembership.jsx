@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
-import { Pin, RefreshCw, Wallet, Info, FolderOpen } from "lucide-react";
+import { Pin, Wallet, Info, FolderOpen } from "lucide-react";
 import Layout from "../components/Layout";
 import { apiFetch } from "../api/api";
 
@@ -8,7 +8,6 @@ function MemberMembership() {
   const [memberships, setMemberships] = useState([]);
   const [message, setMessage] = useState("");
   const [loading, setLoading] = useState(true);
-  const [renewingId, setRenewingId] = useState(null);
 
   const fetchMemberships = async () => {
     try {
@@ -39,42 +38,6 @@ function MemberMembership() {
   useEffect(() => {
     fetchMemberships();
   }, []);
-
-  const handleRenew = async (id) => {
-    setMessage("");
-
-    if (
-      !window.confirm(
-        "Renew this membership? It will start today and last one plan duration."
-      )
-    ) {
-      return;
-    }
-
-    try {
-      setRenewingId(id);
-
-      const response = await apiFetch(
-        `/memberships/${id}/renew`,
-        { method: "PUT" }
-      );
-
-      const data = await response.json();
-
-      if (!response.ok) {
-        setMessage(data.message || "Could not renew.");
-        return;
-      }
-
-      setMessage(data.message);
-      fetchMemberships();
-    } catch (error) {
-      console.error(error);
-      setMessage("Could not connect to the server.");
-    } finally {
-      setRenewingId(null);
-    }
-  };
 
   const active = memberships.find((m) => m.status === "active");
   const past = memberships.filter((m) => m.status !== "active");
@@ -171,19 +134,12 @@ function MemberMembership() {
                 </div>
 
                 <div className="membership-card-actions">
-                  <button
+                  <Link
+                    to={`/dashboard/member/payments?plan=${active.plan?._id || ""}`}
                     className="primary-btn"
-                    onClick={() => handleRenew(active._id)}
-                    disabled={renewingId === active._id}
                   >
-                    {renewingId === active._id ? (
-                      "Renewing..."
-                    ) : (
-                      <>
-                        <RefreshCw /> Renew Now
-                      </>
-                    )}
-                  </button>
+                    <Wallet /> Pay to Renew
+                  </Link>
 
                   <Link
                     to="/dashboard/member/payments"
@@ -214,9 +170,8 @@ function MemberMembership() {
               <h2><Info /> Renewal Information</h2>
               <ul className="info-list">
                 <li>
-                  Renewing will restart your membership{" "}
-                  <strong>today</strong> and extend it by the
-                  plan's full duration (
+                  After payment is confirmed, your membership will
+                  extend by the plan's full duration (
                   {active.plan?.duration} days).
                 </li>
                 <li>
@@ -224,8 +179,7 @@ function MemberMembership() {
                   <strong>{active.plan?.price} ETB</strong>
                 </li>
                 <li>
-                  A new payment is required for each renewal —
-                  head to{" "}
+                  A new payment is required for each renewal. Continue to{" "}
                   <Link to="/dashboard/member/payments">
                     My Payments
                   </Link>{" "}

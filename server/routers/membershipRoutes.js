@@ -37,7 +37,7 @@ router.put(
 router.put(
   "/:id/renew",
   protect,
-  authorize("owner", "receptionist", "member"),
+  authorize("owner", "receptionist"),
   renewMembership
 );
 

@@ -166,6 +166,16 @@ const loginUser = async (req, res) => {
       });
     }
 
+    if (user.role === "member") {
+      const member = await Member.findOne({ user: user._id });
+
+      if (member && (member.status !== "active" || member.archivedAt)) {
+        return res.status(403).json({
+          message: "This member account is inactive. Please contact the gym.",
+        });
+      }
+    }
+
     // Staff must sign in through the secret staff portal
     if (STAFF_ROLES.includes(user.role)) {
       return res.status(403).json({

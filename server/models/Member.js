@@ -42,6 +42,11 @@ const memberSchema = new mongoose.Schema(
       enum: ["active", "inactive"],
       default: "active",
     },
+
+    archivedAt: {
+      type: Date,
+      default: null,
+    },
   },
   {
     timestamps: true,
